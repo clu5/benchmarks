@@ -1,7 +1,6 @@
 medmnist
 click>=8.0.3
 flake8>=4.0.1
-ipython>=8.0.1
 jupyterlab==3.2.8
 matplotlib>=3.5.1
 pandas>=1.0.3
