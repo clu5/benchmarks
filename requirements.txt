@@ -1,6 +1,6 @@
-medmnist
-monai
-tqdm
+medmnist=2.0.4
+monai==0.8.1
+tqdm>=4.61.2
 click>=8.0.3
 flake8>=4.0.1
 jupyterlab==3.2.8

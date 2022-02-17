@@ -17,7 +17,6 @@ from medmnist import INFO, Evaluator
     default='breastmnist', 
     type=click.Choice([
         'pathmnist',
-        'chestmnist',
         'dermamnist',
         'octmnist',
         'pneumoniamnist',
@@ -66,13 +65,13 @@ from medmnist import INFO, Evaluator
     '-lr', '--learning_rate', default=1e-4, type=float, help='Learning rate',
 )
 @click.option(
-    '-e', '--epochs', default=20, type=int, help='Number of training epochs',
+    '-e', '--epochs', default=100, type=int, help='Number of training epochs',
 )
 @click.option(
     '-s', '--seed', default=1234567890, type=int, help='Random seed',
 )
 @click.option(
-    '-r', '--runs', default=1, type=int, help='Runs to estimate variance',
+    '-r', '--runs', default=10, type=int, help='Runs to estimate variance',
 )
 @click.option('-o', '--output_dir', default=Path.cwd(), help='Output directory',
 )
@@ -92,7 +91,7 @@ def main(
         debug: bool,
     ) -> None:
     if debug:
-        stop_iterations = 256
+        stop_iterations = 128
         epochs = 2
         runs = 2
 
@@ -163,10 +162,10 @@ def main(
             dataset=monai_train_dataset, batch_size=batch_size, 
         )
         valid_loader = torch.utils.data.DataLoader(
-            dataset=monai_valid_dataset, batch_size=2*batch_size, 
+            dataset=monai_valid_dataset, batch_size=batch_size, 
         )
         test_loader = torch.utils.data.DataLoader(
-            dataset=monai_test_dataset, batch_size=2*batch_size, 
+            dataset=monai_test_dataset, batch_size=batch_size, 
         )
 
         # make model
@@ -185,13 +184,16 @@ def main(
 
         # optimizer and loss function
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-        if task == 'multi-label, binary-class':
-            criterion = torch.nn.BCEWithLogitsLoss()
-        else:
-            criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.CrossEntropyLoss()
 
         # train model
+        best_val = 0; patience = 0
         for e in range(epochs):
+
+            # early stopping
+            if patience > 10:
+                break 
+
             train_metrics = {
                 'correct': 0,
                 'total': 0
@@ -205,25 +207,19 @@ def main(
                 y = batch_data['label'].cuda()
                 optimizer.zero_grad()
                 y_hat = model(x)
-                if task == 'multi-label, binary-class':
-                    y = y.to(torch.float32)
-                else:
-                    y = y.squeeze().long()
+                y = y.squeeze().long()
                 loss = criterion(y_hat, y)
                 loss.backward()
                 optimizer.step()
-
-                if task != 'multi-label, binary-class':
-                    train_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
-                    train_metrics['total'] += y.shape[0]
+                train_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
+                train_metrics['total'] += batch_size
 
             valid_metrics = {
                 'correct': 0,
                 'total': 0
             }
-
             model.eval()
-            for batch_data in tqdm(valid_loader):
+            for i, batch_data in enumerate(tqdm(valid_loader)):
                 if debug and i > stop_iterations:
                     break
 
@@ -231,19 +227,20 @@ def main(
                 y = batch_data['label'].cuda()
                 with torch.no_grad():
                     y_hat = model(x)
-                    if task != 'multi-label, binary-class':
-                        y = y.squeeze()
-
-                if task != 'multi-label, binary-class':
+                    y = y.squeeze()
                     valid_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
-                    valid_metrics['total'] += y.shape[0]
+                    valid_metrics['total'] += batch_size
 
-            if task != 'multi-label, binary-class':
-                train_accuracy = train_metrics['correct'] / max(1, train_metrics['total'])
-                valid_accuracy = valid_metrics['correct'] / max(1, valid_metrics['total'])
+            train_accuracy = train_metrics['correct'] / train_metrics['total']
+            valid_accuracy = valid_metrics['correct'] / valid_metrics['total']
 
-                print(f'{e}\tTRAIN\t{train_accuracy:.2f}')
-                print(f'{e}\tVALID\t{valid_accuracy:.2f}')
+            if valid_accuracy > best_val:
+                best_val = valid_accuracy
+                patience = 0
+                print(f'{e}\tTRAIN\t{train_accuracy:.3f}')
+                print(f'{e}\tVALID\t{valid_accuracy:.3f}')
+            else:
+                patience += 1
 
         # evaluate model and save predictions 
         model.eval()
@@ -252,15 +249,11 @@ def main(
             valid_y_score = torch.tensor([])
 
             for batch_data in valid_loader:
-                if debug and i > stop_iterations:
-                    break
-
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 y_hat = model(x)
-                if task != 'multi-label, binary-class':
-                    y = y.squeeze()
-                    y = y.resize_(len(y), 1)
+                y = y.squeeze()
+                y = y.resize_(len(y), 1)
 
                 score = y_hat.softmax(dim=-1)
 
@@ -271,28 +264,27 @@ def main(
 
             valid_y_true = valid_y_true.numpy()
             valid_y_score = valid_y_score.numpy()
-            save_exp = f'{dataset}_{architecture}_{r}_valid'
-            np.save(output_dir / f'{save_exp}_true.npy', valid_y_true)
-            np.save(output_dir / f'{save_exp}_score.npy', valid_y_score)
-
-            valid_evaluator = Evaluator(dataset, 'val')
-            valid_metrics = valid_evaluator.evaluate(valid_y_score)
-            print('VALID'.center(20), valid_metrics)
+            if debug:
+                print('valid true', valid_y_true[:10])
+                print('valid score', valid_y_score.argmax(-1)[:10])
+            else:
+                save_exp = f'{dataset}_{architecture}_{r}_valid'
+                np.save(output_dir / f'{save_exp}_true.npy', valid_y_true)
+                np.save(output_dir / f'{save_exp}_score.npy', valid_y_score)
+                valid_evaluator = Evaluator(dataset, 'val')
+                valid_metrics = valid_evaluator.evaluate(valid_y_score)
+                print('VALID'.center(20), valid_metrics)
 
 
             test_y_true = torch.tensor([])
             test_y_score = torch.tensor([])
 
             for batch_data in test_loader:
-                if debug and i > stop_iterations:
-                    break
-
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 y_hat = model(x)
-                if task != 'multi-label, binary-class':
-                    y = y.squeeze()
-                    y = y.resize_(len(y), 1)
+                y = y.squeeze()
+                y = y.resize_(len(y), 1)
 
                 score = y_hat.softmax(dim=-1)
                 y = y.detach().cpu()
@@ -302,13 +294,16 @@ def main(
 
             test_y_true = test_y_true.numpy()
             test_y_score = test_y_score.numpy()
-            save_exp = f'{dataset}_{architecture}_{r}_test'
-            np.save(output_dir / f'{save_exp}_true.npy', test_y_true)
-            np.save(output_dir / f'{save_exp}_score.npy', test_y_score)
-
-            test_evaluator = Evaluator(dataset, 'test')
-            test_metrics = test_evaluator.evaluate(test_y_score)
-            print('TEST'.center(20), test_metrics)
+            if debug:
+                print('test true', test_y_true[:10])
+                print('test score', test_y_score.argmax(-1)[:10])
+            else:
+                save_exp = f'{dataset}_{architecture}_{r}_test'
+                np.save(output_dir / f'{save_exp}_true.npy', test_y_true)
+                np.save(output_dir / f'{save_exp}_score.npy', test_y_score)
+                test_evaluator = Evaluator(dataset, 'test')
+                test_metrics = test_evaluator.evaluate(test_y_score)
+                print('TEST'.center(20), test_metrics)
 
 if __name__ == '__main__':
     start_time = perf_counter()
