@@ -89,6 +89,7 @@ def main(
         output_dir: Path,
     ) -> None:
 
+    use_3d = True if '3d' in dataset else False
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
@@ -126,11 +127,16 @@ def main(
         test_dataset = wrapper(ds=test_dataset)
 
         # wrap in monai dataset to be able to use 3D transforms
-        transform = monai.transforms.Compose([
+        transform = [
             monai.transforms.ScaleIntensityd(keys=['img']),
-            monai.transforms.AsChannelFirstd(keys=['img'], channel_dim=-1),
             #monai.transforms.AddChanneld(keys=['img']),
-        ])
+        ]
+        if not use_3d:
+            transform.append(
+                monai.transforms.AsChannelFirstd(keys=['img'], channel_dim=-1)
+            )
+        transform = monai.transforms.Compose(transform)
+
         monai_train_dataset = monai.data.IterableDataset(
             train_dataset, transform=transform,
         )
@@ -153,7 +159,7 @@ def main(
 
         # make model
         model_parameters = dict(
-            spatial_dims=3 if '3d' in dataset else 2,
+            spatial_dims=3 if use_3d else 2,
             in_channels=num_channels,
         )
         if architecture == 'DenseNet':
