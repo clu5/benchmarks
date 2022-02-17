@@ -1,5 +1,6 @@
 medmnist
 monai
+tqdm
 click>=8.0.3
 flake8>=4.0.1
 jupyterlab==3.2.8

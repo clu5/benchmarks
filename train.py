@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import click
+from tqdm import tqdm
 import numpy as np
 import torch
 import torchvision
@@ -36,27 +37,18 @@ from medmnist import INFO, Evaluator
     help='Pick a MedMNIST dataset',
 )
 @click.option(
-    '-dl', '--download', default=True, help='Download data if true',
-)
-@click.option(
-    '-n', '--normalize', default=(0, 1), type=(float, float),
-    help='Normalize data with these parameters: (mean, std)',
-)
-@click.option(
     '-bs', '--batch_size', default=8, type=int, help='Batch size to use',
 )
 @click.option(
     '-a', '--architecture', 
-    default='DenseNet', 
+    default='SEResNet152', 
     type=click.Choice([
         'DenseNet',
-        'DenseNet121',
-        'DenseNet169',
-        'DenseNet201',
-        'DenseNet264',
         'EfficientNet',
         'SENet',
         'SEResNet50',
+        'SEResNet101',
+        'SEResNet152',
         'HighResNet',
         'ViT',
     ]),
@@ -72,7 +64,7 @@ from medmnist import INFO, Evaluator
     '-lr', '--learning_rate', default=1e-4, type=float, help='Set learning rate',
 )
 @click.option(
-    '-e', '--epochs', default=10, type=int, help='Number of training epochs',
+    '-e', '--epochs', default=20, type=int, help='Number of training epochs',
 )
 @click.option(
     '-s', '--seed', default=1234567890, type=int, help='Random seed',
@@ -87,8 +79,6 @@ from medmnist import INFO, Evaluator
 )
 def main(
         dataset: str, 
-        download: bool, 
-        normalize: tuple[float, float], 
         batch_size: int, 
         architecture: str,
         block_config: list[int],
@@ -98,6 +88,9 @@ def main(
         runs: int,
         output_dir: Path,
     ) -> None:
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
 
     # use multiple model training runs to estimate variance
     for r in range(runs):
@@ -110,37 +103,64 @@ def main(
         num_channels = info['n_channels']
         num_classes = len(info['label'])
 
-        mean, std = normalize
-        transform = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(mean=mean, std=std),
-        ])
-
-        # make dataloaders
+        # make medmnist dataset
         DataClass = getattr(medmnist, info['python_class'])
-        data_parameters = dict(download=download, transform=transform)
-        train_data = DataClass(split='train', **data_parameters)
-        valid_data = DataClass(split='val', **data_parameters)
-        test_data = DataClass(split='test', **data_parameters)
+        train_dataset = DataClass(split='train', download=True)
+        valid_dataset = DataClass(split='val', download=True)
+        test_dataset = DataClass(split='test', download=True)
+
+        # wrap dataset output in dictionary to use dictionary transforms
+        class wrapper():
+            def __init__(self, ds):
+                self.ds = ds
+
+            def __len__(self):
+                return len(self.ds)
+
+            def __getitem__(self, i):
+                img, label = self.ds[i]
+                return {'img': np.array(img), 'label': label}
+
+        train_dataset = wrapper(ds=train_dataset)
+        valid_dataset = wrapper(ds=valid_dataset)
+        test_dataset = wrapper(ds=test_dataset)
+
+        # wrap in monai dataset to be able to use 3D transforms
+        transform = monai.transforms.Compose([
+            monai.transforms.ScaleIntensityd(keys=['img']),
+            monai.transforms.AsChannelFirstd(keys=['img'], channel_dim=-1),
+            #monai.transforms.AddChanneld(keys=['img']),
+        ])
+        monai_train_dataset = monai.data.IterableDataset(
+            train_dataset, transform=transform,
+        )
+        monai_valid_dataset = monai.data.IterableDataset(
+            valid_dataset, transform=transform,
+        )
+        monai_test_dataset = monai.data.IterableDataset(
+            test_dataset, transform=transform,
+        )
 
         train_loader = torch.utils.data.DataLoader(
-            dataset=train_data, batch_size=batch_size, shuffle=True,
+            dataset=monai_train_dataset, batch_size=batch_size, #shuffle=True,
         )
         valid_loader = torch.utils.data.DataLoader(
-            dataset=valid_data, batch_size=2*batch_size, shuffle=False,
+            dataset=monai_valid_dataset, batch_size=2*batch_size, #shuffle=False,
         )
         test_loader = torch.utils.data.DataLoader(
-            dataset=test_data, batch_size=2*batch_size, shuffle=False,
+            dataset=monai_test_dataset, batch_size=2*batch_size, #shuffle=False,
         )
 
         # make model
         model_parameters = dict(
             spatial_dims=3 if '3d' in dataset else 2,
             in_channels=num_channels,
-            out_channels=num_classes,
         )
         if architecture == 'DenseNet':
             model_parameters['block_config'] = block_config
+            model_parameters['out_channels'] = num_classes
+        else:
+            model_parameters['num_classes'] = num_classes
 
         model = getattr(monai.networks.nets, architecture)(**model_parameters)
         model = model.cuda()
@@ -159,18 +179,21 @@ def main(
                 'total': 0
             }
             model.train()
-            for x, y in train_loader:
-                x, y = x.cuda(), y.cuda()
+            for batch_data in tqdm(train_loader):
+                x = batch_data['img'].cuda()
+                y = batch_data['label'].cuda()
                 optimizer.zero_grad()
                 y_hat = model(x)
                 if task != 'multi-label, binary-class':
                     y = y.squeeze()
-                #breakpoint()
                 loss = criterion(y_hat, y.long())
                 loss.backward()
                 optimizer.step()
-                train_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
-                train_metrics['total'] += y.shape[0]
+                if y.shape:
+                    train_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
+                    train_metrics['total'] += y.shape[0]
+                else:
+                    print(y.shape)
 
             valid_metrics = {
                 'correct': 0,
@@ -178,20 +201,24 @@ def main(
             }
 
             model.eval()
-            for x, y in valid_loader:
-                x, y = x.cuda(), y.cuda()
+            for batch_data in tqdm(valid_loader):
+                x = batch_data['img'].cuda()
+                y = batch_data['label'].cuda()
                 with torch.no_grad():
                     y_hat = model(x)
                     if task != 'multi-label, binary-class':
                         y = y.squeeze()
-                valid_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
-                valid_metrics['total'] += y.shape[0]
+                if y.shape:
+                    valid_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
+                    valid_metrics['total'] += y.shape[0]
+                else:
+                    print(y.shape)
 
             train_accuracy = train_metrics['correct'] / train_metrics['total']
             valid_accuracy = valid_metrics['correct'] / valid_metrics['total']
 
-            print(f'{e}\t{train_accuracy:.2f}')
-            print(f'{e}\t{valid_accuracy:.2f}')
+            print(f'{e}\tTRAIN\t{train_accuracy:.2f}')
+            print(f'{e}\tVALID\t{valid_accuracy:.2f}')
 
         # evaluate model and save predictions 
         model.eval()
@@ -199,8 +226,9 @@ def main(
             valid_y_true = torch.tensor([])
             valid_y_score = torch.tensor([])
 
-            for x, y in valid_loader:
-                x, y = x.cuda(), y.cuda()
+            for batch_data in valid_loader:
+                x = batch_data['img'].cuda()
+                y = batch_data['label'].cuda()
                 y_hat = model(x)
                 if task != 'multi-label, binary-class':
                     y = y.squeeze()
@@ -216,11 +244,9 @@ def main(
             valid_y_true = valid_y_true.numpy()
             valid_y_score = valid_y_score.numpy()
             save_exp = f'{dataset}_{architecture}_{r}_valid'
-            output_dir = Path(output_dir)
             np.save(output_dir / f'{save_exp}_true.npy', valid_y_true)
             np.save(output_dir / f'{save_exp}_score.npy', valid_y_score)
 
-            #breakpoint()
             valid_evaluator = Evaluator(dataset, 'val')
             valid_metrics = valid_evaluator.evaluate(valid_y_score)
             print('VALID'.center(20), valid_metrics)
@@ -229,8 +255,9 @@ def main(
             test_y_true = torch.tensor([])
             test_y_score = torch.tensor([])
 
-            for x, y in test_loader:
-                x, y = x.cuda(), y.cuda()
+            for batch_data in test_loader:
+                x = batch_data['img'].cuda()
+                y = batch_data['label'].cuda()
                 y_hat = model(x)
                 if task != 'multi-label, binary-class':
                     y = y.squeeze()
