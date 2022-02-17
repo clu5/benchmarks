@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import click
+from time import perf_counter
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -41,16 +42,17 @@ from medmnist import INFO, Evaluator
 )
 @click.option(
     '-a', '--architecture', 
-    default='SEResNet152', 
+    default='DenseNet', 
     type=click.Choice([
         'DenseNet',
-        'EfficientNet',
-        'SENet',
+        'ResNet',
+        #'EfficientNet',
+        #'SENet',
         'SEResNet50',
         'SEResNet101',
         'SEResNet152',
-        'HighResNet',
-        'ViT',
+        #'HighResNet',
+        #'ViT',
     ]),
     help='Choose a model architecture',
 )
@@ -61,7 +63,7 @@ from medmnist import INFO, Evaluator
     help='Number of blocks for DenseNet architecture',
 )
 @click.option(
-    '-lr', '--learning_rate', default=1e-4, type=float, help='Set learning rate',
+    '-lr', '--learning_rate', default=1e-4, type=float, help='Learning rate',
 )
 @click.option(
     '-e', '--epochs', default=20, type=int, help='Number of training epochs',
@@ -70,12 +72,12 @@ from medmnist import INFO, Evaluator
     '-s', '--seed', default=1234567890, type=int, help='Random seed',
 )
 @click.option(
-    '-r', '--runs', default=1, type=int, help='How many runs to calculate variance',
+    '-r', '--runs', default=1, type=int, help='Runs to estimate variance',
+)
+@click.option('-o', '--output_dir', default=Path.cwd(), help='Output directory',
 )
 @click.option(
-    '-o', '--output_dir', 
-    default=Path.cwd(), 
-    help='Directory in which to write all results',
+    '--debug', is_flag=True, help='Use subset of data and print more verbosely',
 )
 def main(
         dataset: str, 
@@ -87,7 +89,12 @@ def main(
         seed: int,
         runs: int,
         output_dir: Path,
+        debug: bool,
     ) -> None:
+    if debug:
+        stop_iterations = 256
+        epochs = 2
+        runs = 2
 
     use_3d = True if '3d' in dataset else False
     output_dir = Path(output_dir)
@@ -110,6 +117,10 @@ def main(
         valid_dataset = DataClass(split='val', download=True)
         test_dataset = DataClass(split='test', download=True)
 
+        img_size = np.array(train_dataset[0][0]).shape
+        if debug:
+            print(f'img_size: {img_size}')
+
         # wrap dataset output in dictionary to use dictionary transforms
         class wrapper():
             def __init__(self, ds):
@@ -129,12 +140,13 @@ def main(
         # wrap in monai dataset to be able to use 3D transforms
         transform = [
             monai.transforms.ScaleIntensityd(keys=['img']),
-            #monai.transforms.AddChanneld(keys=['img']),
         ]
-        if not use_3d:
-            transform.append(
-                monai.transforms.AsChannelFirstd(keys=['img'], channel_dim=-1)
-            )
+        if dataset in ('octmnist', 'pneumoniamnist', 'breastmnist', 'tissuemnist'):
+            transform.append(monai.transforms.AddChanneld(keys=['img']))
+        elif dataset in ('pathmnist', 'dermamnist', 'retinamnist', 'bloodmnist'):
+            transform.append(monai.transforms.AsChannelFirstd(keys=['img'], channel_dim=-1))
+
+
         transform = monai.transforms.Compose(transform)
 
         monai_train_dataset = monai.data.IterableDataset(
@@ -148,13 +160,13 @@ def main(
         )
 
         train_loader = torch.utils.data.DataLoader(
-            dataset=monai_train_dataset, batch_size=batch_size, #shuffle=True,
+            dataset=monai_train_dataset, batch_size=batch_size, 
         )
         valid_loader = torch.utils.data.DataLoader(
-            dataset=monai_valid_dataset, batch_size=2*batch_size, #shuffle=False,
+            dataset=monai_valid_dataset, batch_size=2*batch_size, 
         )
         test_loader = torch.utils.data.DataLoader(
-            dataset=monai_test_dataset, batch_size=2*batch_size, #shuffle=False,
+            dataset=monai_test_dataset, batch_size=2*batch_size, 
         )
 
         # make model
@@ -185,21 +197,25 @@ def main(
                 'total': 0
             }
             model.train()
-            for batch_data in tqdm(train_loader):
+            for i, batch_data in enumerate(tqdm(train_loader)):
+                if debug and i > stop_iterations:
+                    break
+
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 optimizer.zero_grad()
                 y_hat = model(x)
-                if task != 'multi-label, binary-class':
-                    y = y.squeeze()
-                loss = criterion(y_hat, y.long())
+                if task == 'multi-label, binary-class':
+                    y = y.to(torch.float32)
+                else:
+                    y = y.squeeze().long()
+                loss = criterion(y_hat, y)
                 loss.backward()
                 optimizer.step()
-                if y.shape:
+
+                if task != 'multi-label, binary-class':
                     train_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
                     train_metrics['total'] += y.shape[0]
-                else:
-                    print(y.shape)
 
             valid_metrics = {
                 'correct': 0,
@@ -208,23 +224,26 @@ def main(
 
             model.eval()
             for batch_data in tqdm(valid_loader):
+                if debug and i > stop_iterations:
+                    break
+
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 with torch.no_grad():
                     y_hat = model(x)
                     if task != 'multi-label, binary-class':
                         y = y.squeeze()
-                if y.shape:
+
+                if task != 'multi-label, binary-class':
                     valid_metrics['correct'] += (y_hat.argmax(-1) == y).sum().item()
                     valid_metrics['total'] += y.shape[0]
-                else:
-                    print(y.shape)
 
-            train_accuracy = train_metrics['correct'] / train_metrics['total']
-            valid_accuracy = valid_metrics['correct'] / valid_metrics['total']
+            if task != 'multi-label, binary-class':
+                train_accuracy = train_metrics['correct'] / max(1, train_metrics['total'])
+                valid_accuracy = valid_metrics['correct'] / max(1, valid_metrics['total'])
 
-            print(f'{e}\tTRAIN\t{train_accuracy:.2f}')
-            print(f'{e}\tVALID\t{valid_accuracy:.2f}')
+                print(f'{e}\tTRAIN\t{train_accuracy:.2f}')
+                print(f'{e}\tVALID\t{valid_accuracy:.2f}')
 
         # evaluate model and save predictions 
         model.eval()
@@ -233,6 +252,9 @@ def main(
             valid_y_score = torch.tensor([])
 
             for batch_data in valid_loader:
+                if debug and i > stop_iterations:
+                    break
+
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 y_hat = model(x)
@@ -262,6 +284,9 @@ def main(
             test_y_score = torch.tensor([])
 
             for batch_data in test_loader:
+                if debug and i > stop_iterations:
+                    break
+
                 x = batch_data['img'].cuda()
                 y = batch_data['label'].cuda()
                 y_hat = model(x)
@@ -286,5 +311,8 @@ def main(
             print('TEST'.center(20), test_metrics)
 
 if __name__ == '__main__':
+    start_time = perf_counter()
     main()
+    end_time = perf_counter()
+    print(f'Runtime: {end_time - start_time:.0f}s')
 
